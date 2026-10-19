@@ -1,0 +1,63 @@
+dataset:
+  conv_cols: [general_ghi, general_temp]
+  conv_predict_cols: [general_ghi_predict, general_temp_predict]
+  pv_col: observe_power
+  tsfm_col: chronos
+  target_col: observe_power_future
+  timestamp_col: timestamp_win
+  entity_col: station
+  # Fixed installed capacity in the same unit as power. No target-derived fallback.
+  capacity_col: cap_mw
+  # Optional {station: capacity}; when nonempty this replaces capacity_col.
+  capacity_by_station: {}
+  p_clear_col: p_clear
+  night_col: is_night
+inference:
+  input_len: 672
+  pred_len: 192
+model:
+  enc_in: 3
+  patch_len: 96
+  stride: 96
+  padding_patch: 'None'
+  revin: true
+  affine: false
+  subtract_last: false
+  d_model: 256
+  n_heads: 4
+  e_layers: 4
+  d_ff: 1024
+  dropout: 0.1
+  fc_dropout: 0.2
+  head_dropout: 0.1
+  activation: ReLU
+  embedding_dim: 256
+  loss_type: pinball
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+decision:
+  physics:
+    clip_negative: true
+    capacity_cap: true
+    clear_sky_cap: false
+    clear_sky_cap_ratio: 1.05
+    night_zero: false
+  point:
+    default: p_star
+    by_step: [{steps: [0, 16], method: p_star_l1}]
+    floor_ratio: 0.2
+    tau_grid_step: 0.005
+    tail: flat
+    shrink_factor: 1.0
+optimization:
+  random_seed: 2025
+  train_epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  warmup_ratio: 0.01
+  batch_size: 64                  # Per device; quantile decisions need extra memory.
+  eval_batch_size: 32
+  gradient_accumulation_steps: 1
+  patience: 10
+  num_workers: 0
+  use_cpu: false
+  fp16: true                     # Automatically disabled when CUDA is unavailable.
