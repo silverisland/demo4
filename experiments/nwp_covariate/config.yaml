@@ -1,267 +1,202 @@
 # ============================================================================
-# M5（TimesFM-3）NWP 协变量组合实验 —— 唯一配置入口
+# M5（TimesFM-3）气象协变量组合实验 —— 唯一配置入口
 #
-# 数据流：
-#   部署机 multi_infer.get_feature_store(t)  →  ds_trajectory_input/*.parquet（DS 层，含全部源字段）
-#     → build_feature_store.py（列映射 + 单位统一 + 衍生量 + 缺失补全）→ feature_store/station=*.parquet
-#     → screen.py（免模型筛选）
-#     → run_experiments.py（每个实验生成一份 M5 configs.yaml，复用 eval_shell/eval_pretrain.py 推理 + 南网指标）
-#     → compare.py（与 baseline 配对检验，出 report.md）
+# 流程（cwd = 仓库根）：
+#   1. features.py        DS 轨迹表 -> 特征库（按 features 段构建全部候选，线上同款格点/跨源聚合）
+#   2. run_experiments.py 跑 experiments 段里的显式组合（C0 无协变量、C1 线上 general_GHI+general_TEMP ...）
+#   3. rank_lgbm.py       LightGBM 粗排：对 C0 残差做置换重要性 + TreeSHAP，输出候选排序
+#   4. search_m5.py       M5 精排：按粗排顺序逐个尝试"并排加入"或"与已选同类特征融合"，按保留规则贪心
 #
-# 约定：标准名 <name> 为历史 672 点，<name>_predict 为未来 192 点。实验里只写 <name>，
-#       runner 自动展开成 M5 的 past_future_cols: [[<name>, <name>_predict]]。
+# 字段约束（fields.py 强制检查）：
+#   - 只能用 DS 表的 128 列；历史列 X 与 X_predict 必须成对使用；GHI_real 只有历史段 -> 只能当 past-only；
+#   - observe_power_future 是标签，不进任何特征。
+# 命名约定：特征 <name> 是历史 672 点，<name>_predict 是未来 pred_len 点；实验里只写 <name>。
 # ============================================================================
 
 run:
-  name: nwp_cov_v1
-  out_dir: runs/m5/nwp_cov/${run.name}
+  name: nwp_cov_v2
+  out_dir: runs/m5/nwp_cov/${run.name}/{predict_type}
+  backend: m5                        # m5 | mock（mock 只用于本机无权重时跑通流程）
   device: auto
   batch_size: 512
-  num_workers: 8                      # 与 eval_pretrain.sh 一致，按站分片并行
-
-# ----------------------------------------------------------------------------
-# 0. DS 表从哪来。两种模式二选一：
-#    ds_parquet：直接读部署机 multi_infer.get_feature_store() 已落盘的 ds_trajectory_input
-#    ods       ：由本目录 make_ds.py 调 DataSetInterface.prepare_infer_data() 逐起报时刻现做
-#                （需要 vendor/ods_transform 或部署机 sys.path，且能访问 data_path 各源），
-#                产物写到 ods.out_dir，目录结构与 ds_trajectory_input 相同，之后按 ds_parquet 模式读。
-# ----------------------------------------------------------------------------
-report_times:                         # 多起报时刻 = 多天回测（镜像 multi_infer.__main__ 的两个循环）
-  short:       { start: "2026-08-25 10:00:00", end: "2026-09-15 10:00:00", step: "1D" }
-  ultra_short: { start: "2026-08-26 02:00:00", end: "2026-08-31 23:45:00", step: "15min" }
-
-ods:
-  area: province_guangxi_solar
-  info_csv: /jtdata/products/data/info.csv         # plant_pointname / LONGITUDE / LATITUDE / GCCAPACITY / province_pointname
-  sys_path:                                        # 找不到 vendor/ods_transform 时按顺序加入 sys.path
-    - /home/nfdw/nuoya/algo/nuoya_algo/ensemble_model
-    - /home/nfdw/nuoya/
-  vendor_dir: experiments/nwp_covariate/vendor     # 把部署机 ods_transform/ 整个目录拷到这里即可离线复用
-  save_history_data_dir: /home/nfdw/nuoya/data/train
-  save_infer_data_dir:   /home/nfdw/nuoya/data/infer_nwp_cov   # 独立缓存目录，不污染线上 infer 缓存
-  clean_cache_each_call: true
-  data_path:                                       # 与 multi_infer.data_path 相同；GFS 接入后在此加键
-    power: ""
-    observe_weather: ""
-    SOLARGIS: ""
-    solar_southern: ""
-    GDFS_JTHFGNED_MID_JTNWQISX: ""
-    EC_JTKRD7RO: ""
-  only_power: false
-  history_len: 672
-  predict_seq_lens: { short: 480, ultra_short: 192 }
-  out_dir: experiments/nwp_covariate/ds/{predict_type}   # date=YYYY-MM-DD/time=HH:MM/<rtime>.parquet
-  dtype: float32
-  # 字段词典：拿到 DataSetInterface 源码后，把它内部"抽哪些字段"的清单暴露到这里；
-  # 为空表示沿用其默认（全部）。
-  field_dict: {}
+  log_every_batches: 8               # 推理每 8 个 batch（=4096 行）打一行进度
+  sys_path: []                       # 找不到 forecast_backbones/pipelines 时，填"直接包含这些目录的那一层"，如 [/home/xxx/NextGenPVForecast]
 
 data:
-  input_mode: ds_parquet              # ds_parquet | ods
-  # DS 轨迹表 glob。{predict_type} 会被替换。ods 模式下自动指向 ods.out_dir。
-  ds_trajectory_glob: "/home/nfdw/nuoya/data/train/ds_trajectory_input/area=province_guangxi_solar/predict_type={predict_type}/date=*/*.parquet"
-  predict_type: ultra_short           # short 的未来段是 480 点，构建时截到 pred_len
+  # 线上 multi_infer 落盘的 DS 表；{predict_type} 会被替换
+  ds_glob: "/home/nfdw/nuoya/data/train/ds_trajectory_input/area=province_guangxi_solar/predict_type={predict_type}/date=*/*.parquet"
+  predict_type: short                # short | ultra_short
   context_len: 672
-  pred_len: 192
-  step_min: 15
-  timezone: Asia/Shanghai
-  time_range: null                    # null = report_times[predict_type] 的范围；或 { start, end }
-  stations: all                       # 或列表 ["plant_guangfu_xxx", ...]
-  drop_province_row: true             # station == area 的省级行不参与站级实验
-  id_cols: [timestamp_win, station]
-  target: observe_power
-  label: observe_power_future
-  cap_col: cap_power_on               # 数组列时取最后一个有效值
-  station_meta: forecast_backbones/m6/station_meta.csv   # station, lat, lon, alt_m（晴空 GHI 需要）
+  pred_len: 192                      # short 的未来段 480 点，截前 192；D+1 只用第 55..150 步
+  time_range: null                   # 或 { start: "2026-08-25 00:00:00", end: "2026-09-15 23:45:00" }
+  stations: all                      # 或 ["plant_xxx", ...]
+  drop_province_row: true
+  area: province_guangxi_solar
+  cap_col: cap_power_on              # 线上 cap_power_on_val = cap_power_on[-1]
+  cap_default: 1.0
+  station_meta: forecast_backbones/m6/station_meta.csv   # station, lat, lon；没匹配上的站用 default_latlon
+  default_latlon: [23.8, 108.8]      # 广西中部；设为 null 则退化为时钟几何（06:15-20:00 常数）
+  tz_offset_h: 8
   feature_store: experiments/nwp_covariate/feature_store/{predict_type}
-  dtype: float32                      # DS 表是 float16 落的，读入后升精度
+  repair_tail:                       # 线上 fix_observe_power_tail_miss：observe_power 尾部缺失用 M5 单变量补
+    enabled: false
+    fix_len: 600
 
-# ----------------------------------------------------------------------------
-# 1. 列映射：DS 原始列 → 标准名。raw 是 DS 表里的历史列名，未来列 = raw + future_suffix。
-#    先跑 inspect_columns.py 看真实列名再填。kind 决定单位转换：
-#      wm2 | accum_jm2（自起报累积，差分/秒）| avg6h（GFS 6h 周期均值，反平均）
-#      kelvin | celsius | frac | pct | ms（风分量）| mm_accum | code
-#    resolution_min：该源原始时间步长；不是 15 时按 kt 插值（辐照）或线性插值（其他）到 15 分钟。
-# ----------------------------------------------------------------------------
-columns:
-  future_suffix: _predict
-  sources:
-    ec:
-      prefix: "EC_JTKRD7RO_"          # TODO: 用 inspect_columns.py 确认
-      resolution_min: 60              # TODO
-      fields:
-        ghi_ec:   { raw: ssrd,  kind: accum_jm2 }
-        fdir_ec:  { raw: fdir,  kind: accum_jm2 }
-        cdir_ec:  { raw: cdir,  kind: accum_jm2 }
-        ghi_xr:   { raw: sr_15min_xr, kind: wm2, optional: true }
-        tcc_ec:   { raw: tcc,   kind: frac }
-        lcc_ec:   { raw: lcc,   kind: frac }
-        mcc_ec:   { raw: mcc,   kind: frac }
-        hcc_ec:   { raw: hcc,   kind: frac }
-        t2m_ec:   { raw: t2m,   kind: kelvin }
-        skt_ec:   { raw: skt,   kind: kelvin }
-        u10_ec:   { raw: u10,   kind: ms }
-        v10_ec:   { raw: v10,   kind: ms }
-        cp_ec:    { raw: cp,    kind: mm_accum }
-        tp_ec:    { raw: tp,    kind: mm_accum }
-        vis_ec:   { raw: vis,   kind: raw }
-        cape_ec:  { raw: cape,  kind: raw }
-        rh1000_ec: { raw: rh_hl_1000, kind: pct }
-    gdfs:
-      prefix: "GDFS_JTHFGNED_MID_JTNWQISX_"   # TODO 确认
-      resolution_min: 60                     # TODO：有 pre_15m 字段，可能是 15
-      fields:
-        ghi_gdfs:  { raw: sr,        kind: wm2 }
-        tcc_gdfs:  { raw: tcc,       kind: pct }
-        lcc_gdfs:  { raw: lcc,       kind: pct }
-        t2m_gdfs:  { raw: tem_hl_10, kind: celsius }
-        skt_gdfs:  { raw: skt,       kind: celsius }
-        ws10_gdfs: { raw: ws_hl_10,  kind: raw }
-        rh10_gdfs: { raw: rhu_hl_10, kind: pct }
-        pre1h_gdfs: { raw: pre_1h,   kind: raw }
-        vis_gdfs:  { raw: vis,       kind: raw }
-    solargis:
-      prefix: ""                      # RULES 聚合后叫 general_GHI；原始列名待确认
-      resolution_min: 15
-      fields:
-        ghi_solargis:  { raw: general_GHI,  kind: wm2 }
-        temp_solargis: { raw: general_TEMP, kind: celsius }
-    solar_southern:
-      prefix: ""
-      resolution_min: 15
-      fields:
-        ghi_ss:  { raw: solar_southern_GHI,  kind: wm2 }
-        temp_ss: { raw: solar_southern_TEMP, kind: celsius }
-    obs:                              # 站点实测气象：只有历史段，没有 _predict
-      prefix: "observe_weather_"      # TODO 确认
-      history_only: true
-      fields:
-        ghi_obs:  { raw: GHI,  kind: wm2 }
-        temp_obs: { raw: TEMP, kind: celsius }
-  # GFS 目前不在 multi_infer.data_path 里，接入后在这里加 gfs 段即可（kind: avg6h 已支持）。
-
-# ----------------------------------------------------------------------------
-# 2. 衍生量：按顺序执行，每个同时产出历史段与未来段。op 在 ops.py 里注册。
-# ----------------------------------------------------------------------------
-derived:
-  - { name: ghi_clear,  op: clear_sky_ghi }                                  # pvlib Ineichen，缺坐标退 Haurwitz/时钟几何
-  - { name: ws10_ec,    op: wind_speed,  args: { u: u10_ec, v: v10_ec } }
-  - { name: dhi_ec,     op: sub,         args: { a: ghi_ec, b: fdir_ec } }
-  - { name: beam_tr_ec, op: ratio,       args: { num: fdir_ec, den: cdir_ec, min_den: 20 } }   # 直射透过率
-  - { name: kt_ec,      op: kt,          args: { ghi: ghi_ec,   clear: ghi_clear, min_clear: 50 } }
-  - { name: kt_gdfs,    op: kt,          args: { ghi: ghi_gdfs, clear: ghi_clear, min_clear: 50 } }
-  - { name: kt_sg,      op: kt,          args: { ghi: ghi_solargis, clear: ghi_clear, min_clear: 50 } }
-  - { name: ghi_cons,   op: consensus,   args: { members: [ghi_ec, ghi_gdfs, ghi_solargis], mode: skill,
-                                                 skill_window_days: 30, per_lead_bins: [0, 16, 96, 192] } }
-  - { name: ghi_med,    op: consensus,   args: { members: [ghi_ec, ghi_gdfs, ghi_solargis], mode: median } }
-  - { name: kt_cons,    op: kt,          args: { ghi: ghi_cons, clear: ghi_clear, min_clear: 50 } }
-  - { name: spread,     op: spread,      args: { members: [kt_ec, kt_gdfs, kt_sg] } }
-  - { name: ghi_cloud_ec, op: cloud_ghi, args: { clear: ghi_clear, tcc: tcc_ec, a: 0.75, b: 3.4 } }
-  - { name: t_cell,     op: cell_temp,   args: { ghi: ghi_cons, temp: t2m_ec, wind: ws10_ec, model: faiman } }
-  - { name: p_phys,     op: p_phys,      args: { ghi: ghi_cons, t_cell: t_cell, gamma: -0.004, cap: "${data.cap_col}" } }
-  - { name: precip_ec,  op: accum_diff,  args: { x: tp_ec } }
-  - { name: rain_flag,  op: gt,          args: { x: precip_ec, thr: 0.1 } }
-
-# ----------------------------------------------------------------------------
-# 3. 缺失补全链：键是标准名，值按优先级排列。const:xx 为常数；kt_recent 用最近 N 天
-#    observe_power/p_clear 的白天中位数。整源缺失时历史段与未来段一起换源（同源原则）。
-#    缺失比例 > max_missing_frac 的协变量对在该次推理中整体移除，不硬填。
-# ----------------------------------------------------------------------------
-fallback:
-  max_missing_frac: 0.30
-  kt_recent_days: 7
-  chains:
-    ghi_ec:    [ghi_xr, ghi_gdfs, ghi_solargis, ghi_cloud_ec, ghi_kt_recent, ghi_clear]
-    ghi_gdfs:  [ghi_ec, ghi_solargis, ghi_cloud_ec, ghi_kt_recent, ghi_clear]
-    ghi_solargis: [ghi_ec, ghi_gdfs, ghi_cloud_ec, ghi_kt_recent, ghi_clear]
-    ghi_cons:  [ghi_ec, ghi_gdfs, ghi_solargis, ghi_cloud_ec, ghi_kt_recent, ghi_clear]   # 成员缺失先重归一化权重
-    t2m_ec:    [t2m_gdfs, temp_solargis, "skt_ec-8", temp_climatology, "const:25"]
-    tcc_ec:    [tcc_gdfs, tcc_from_kt]
-    lcc_ec:    [lcc_gdfs, tcc_ec]
-    dhi_ec:    [dhi_erbs, drop]
-    ws10_ec:   [ws10_gdfs, "const:2"]
-    ghi_clear: [ghi_clear_clock]        # 缺坐标：时钟几何
-
-# ----------------------------------------------------------------------------
-# 4. 免模型筛选（阶段 0，不占 GPU）
-# ----------------------------------------------------------------------------
-screening:
-  enabled: true
-  ridge:                              # 自实现 XReg：历史 672 拟合，未来 192 样本外 R²/RMSE
-    alpha: 1.0
-    base: [ghi_cons]                  # 增量 ΔR² 的基线特征
-    candidates: all_derived           # 或显式列表
-  lgbm:
-    enabled: false                    # 训练机装了 lightgbm 再打开
-    n_estimators: 400
-    cv: station_time_split
-  out: ${run.out_dir}/screening.xlsx
-
-# ----------------------------------------------------------------------------
-# 5. M5 基础配置：每个实验复制一份到 ${run.out_dir}/<exp_id>/config/configs.yaml，
-#    只改 timesfm3.past_future_cols / past_only_cols。
-# ----------------------------------------------------------------------------
-m5_base:
+m5:                                  # 与线上 M5 推理配置同构（transformer_models.DEFAULT_CFG 的键）
   checkpoint: /data/tangqingang/timesfm-3.0-pytorch
-  per_core_batch_size: 64
+  device: auto
+  per_core_batch_size: 32
   return_quantiles: true
-  predict_quantile: null
-  use_znorm: false
+  nan_policy: interp
   make_positive: true
+  use_znorm: false
   use_symmetric_averaging: true
-  nan_policy: raise                   # 实验态要暴露缺失，不允许静默内插
+
+postprocess:                         # 线上 multi_infer：负值置 0 + 20:00~06:00（含两端）置 0
+  clip_negative: true
+  night_zero: ["20:00", "06:00"]
 
 # ----------------------------------------------------------------------------
-# 6. 实验清单。past_future 写标准名，自动展开成 [[name, name_predict]]；
-#    extends 继承另一个实验再增删；ablation 在 feature_store 读入后、推理前施加。
+# 特征目录。每个特征：op + 参数 + 元信息
+#   quantity: ghi | temp | power | wind | other   —— 粗排分组、精排时判断"同类可融合"
+#   source:   EC | GDFS | SS | SG | obs | fused | derived
+#   fusible:  true 表示精排时可与同 quantity 的已选特征合成一列
+#   candidate: false 表示只作中间量/参考，不进粗排候选
+# 可用 op：raw / grid / combine / clear_sky / kt / p_phys / threshold / scale / diff / trig（见 ops.py）
+# ----------------------------------------------------------------------------
+features:
+  # ---- 第 1 层：单源单列（格点源 9 点中位数、min_valid=2，与线上 RULES 第一层一致）
+  ghi_ec:    { op: grid, source: EC,   var: ghi,  method: median, min_valid: 2, quantity: ghi,  fusible: true }
+  ghi_gdfs:  { op: grid, source: GDFS, var: ghi,  method: median, min_valid: 2, quantity: ghi,  fusible: true }
+  ghi_ss:    { op: grid, source: SS,   var: ghi,  method: median, min_valid: 2, quantity: ghi,  fusible: true }
+  ghi_sg:    { op: raw,  col: GHI_SOLARGIS,                                  quantity: ghi,  source: SG, fusible: true }
+  temp_ec:   { op: grid, source: EC,   var: temp, method: median, min_valid: 2, quantity: temp, fusible: true }
+  temp_gdfs: { op: grid, source: GDFS, var: temp, method: median, min_valid: 2, quantity: temp, fusible: true }
+  temp_ss:   { op: grid, source: SS,   var: temp, method: median, min_valid: 2, quantity: temp, fusible: true }
+  temp_sg:   { op: raw,  col: TEMP_SOLARGIS,                                 quantity: temp, source: SG, fusible: true }
+  ws_sg:     { op: raw,  col: WS_SOLARGIS,   quantity: wind,  source: SG }
+  wd_sin_sg: { op: trig, x: wd_sg, fn: sin,  quantity: wind,  source: SG }
+  wd_cos_sg: { op: trig, x: wd_sg, fn: cos,  quantity: wind,  source: SG }
+  wd_sg:     { op: raw,  col: WD_SOLARGIS,   quantity: wind,  source: SG, candidate: false }
+  prec_sg:   { op: raw,  col: PREC_SOLARGIS, quantity: other, source: SG }
+  pwat_sg:   { op: raw,  col: PWAT_SOLARGIS, quantity: other, source: SG }
+  sdwe_sg:   { op: raw,  col: SDWE_SOLARGIS, quantity: other, source: SG }
+  ghi_real:  { op: raw,  col: GHI_real, history_only: true, quantity: ghi, source: obs }
+
+  # ---- 第 1 层变体：格点内取法（中心点 / 均值 / 格点离散度 = 云边缘信号）
+  ghi_ec_p13:    { op: grid, source: EC,   var: ghi, method: point, point: 13, quantity: ghi, fusible: true }
+  ghi_gdfs_p13:  { op: grid, source: GDFS, var: ghi, method: point, point: 13, quantity: ghi, fusible: true }
+  ghi_ec_gstd:   { op: grid, source: EC,   var: ghi, method: std, min_valid: 2, quantity: other }
+  ghi_gdfs_gstd: { op: grid, source: GDFS, var: ghi, method: std, min_valid: 2, quantity: other }
+
+  # ---- 第 2 层：跨源融合。general_* 与线上 RULES 完全一致（GDFS、EC、SOLARGIS 中位数，min_valid=2）
+  general_ghi:  { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg],   method: median, min_valid: 2, quantity: ghi,  source: fused }
+  general_temp: { op: combine, members: [temp_gdfs, temp_ec, temp_sg], method: median, min_valid: 2, quantity: temp, source: fused }
+  ghi_mean4:    { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: mean,      min_valid: 2, quantity: ghi, source: fused }
+  ghi_med4:     { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: median,    min_valid: 2, quantity: ghi, source: fused }
+  ghi_trim4:    { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: trim_mean, min_valid: 2, quantity: ghi, source: fused }
+  ghi_inverr:   { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: inv_error, reference: ghi_real,
+                  err_power: 1.0, min_clear: 50, window_steps: 672, quantity: ghi, source: fused }
+  ghi_inverr_p: { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: inv_error, reference: power,
+                  err_power: 1.0, min_clear: 50, window_steps: 672, quantity: ghi, source: fused }
+  ghi_bias:     { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: bias_mean, reference: ghi_real,
+                  min_clear: 50, window_steps: 672, bias_clip: [0.5, 2.0], quantity: ghi, source: fused }
+  ghi_max4:     { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: max, min_valid: 2, quantity: other, source: fused }
+  ghi_min4:     { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: min, min_valid: 2, quantity: other, source: fused }
+  ghi_spread4:  { op: combine, members: [ghi_gdfs, ghi_ec, ghi_sg, ghi_ss], method: std, min_valid: 2, quantity: other, source: fused }
+  temp_mean4:   { op: combine, members: [temp_gdfs, temp_ec, temp_sg, temp_ss], method: mean, min_valid: 2, quantity: temp, source: fused }
+
+  # ---- 第 3 层：物理衍生
+  ghi_clear:    { op: clear_sky, quantity: ghi, source: derived }
+  kt_ec:        { op: kt, ghi: ghi_ec,   quantity: other, source: EC, candidate: false }
+  kt_gdfs:      { op: kt, ghi: ghi_gdfs, quantity: other, source: GDFS, candidate: false }
+  kt_sg:        { op: kt, ghi: ghi_sg,   quantity: other, source: SG, candidate: false }
+  kt_ss:        { op: kt, ghi: ghi_ss,   quantity: other, source: SS, candidate: false }
+  kt_cons:      { op: combine, members: [kt_gdfs, kt_ec, kt_sg, kt_ss], method: median, min_valid: 2, quantity: other, source: fused }
+  kt_general:   { op: kt, ghi: general_ghi, quantity: other, source: derived }
+  p_phys:       { op: p_phys, ghi: general_ghi, temp: general_temp, wind: ws_sg, quantity: power, source: derived }
+  p_phys_mean4: { op: p_phys, ghi: ghi_mean4,   temp: temp_mean4,   wind: ws_sg, quantity: power, source: derived }
+
+# ----------------------------------------------------------------------------
+# 显式实验。covariates 里写特征名；history_only 的特征自动进 past_only_cols。
+# extends: 继承另一个实验的 covariates 再追加。baseline: 配对比较的对象（默认 evaluation.baseline）。
 # ----------------------------------------------------------------------------
 experiments:
-  baseline: C1
-  list:
-    - { id: C0,  past_future: [], past_only: [] }
-    - { id: C1,  past_future: [ghi_solargis, temp_solargis] }              # 线上现状
-    - { id: C2a, past_future: [ghi_ec,   temp_solargis] }
-    - { id: C2b, past_future: [ghi_gdfs, temp_solargis] }
-    - { id: C2c, past_future: [ghi_ss,   temp_solargis] }
-    - { id: C2d, past_future: [ghi_xr,   temp_solargis], requires: [ghi_xr] }
-    - { id: C3a, past_future: [ghi_cons, t2m_ec] }
-    - { id: C3b, past_future: [ghi_med,  t2m_ec] }
-    - { id: C3c, past_future: [p_phys] }
-    - { id: C3d, past_future: [kt_cons, ghi_clear] }
-    - { id: C3e, past_future: [[ghi_obs, ghi_cons_predict], t2m_ec] }       # 显式写对：历史实测、未来 NWP
-    - { id: C3f, extends: C3a, past_only: [ghi_obs, temp_obs] }
-    # 阶段 4：在阶段 3 胜者上逐个加（胜者定了再把 extends 改掉）
-    - { id: C4_lcc,    extends: C3a, add_past_future: [lcc_ec] }
-    - { id: C4_tcc,    extends: C3a, add_past_future: [tcc_ec] }
-    - { id: C4_dhi,    extends: C3a, add_past_future: [dhi_ec] }
-    - { id: C4_rain,   extends: C3a, add_past_future: [precip_ec] }
-    - { id: C4_tcell,  extends: C3a, add_past_future: [t_cell] }
-    - { id: C4_spread, extends: C3a, add_past_future: [spread] }
-    - { id: C4_vis,    extends: C3a, add_past_future: [vis_ec] }
-    - { id: C4_ws,     extends: C3a, add_past_future: [ws10_ec] }
-    # 阶段 5：缺失与退化消融（C5 = 阶段 4 锁定后的集合）
-    - { id: C5,            extends: C3a }
-    - { id: C5_drop_ec,    extends: C5, ablation: { drop_sources: [ec],   apply_fallback: true } }
-    - { id: C5_drop_gdfs,  extends: C5, ablation: { drop_sources: [gdfs], apply_fallback: true } }
-    - { id: C5_drop_sg,    extends: C5, ablation: { drop_sources: [solargis], apply_fallback: true } }
-    - { id: C5_fut_tail,   extends: C5, ablation: { mask_future_tail: 96, apply_fallback: true } }
-    - { id: C5_hist_tail,  extends: C5, ablation: { mask_hist_tail: 96,   apply_fallback: true } }
-    - { id: C5_stale,      extends: C5, ablation: { nwp_lag_days: 1 } }
-    - { id: C5_no_coord,   extends: C5, ablation: { drop_station_meta: true, apply_fallback: true } }
+  C0:          { covariates: [], baseline: null, note: "纯功率零样本（不做配对比较）" }
+  C1_online:   { covariates: [general_ghi, general_temp], baseline: C0, note: "线上现状" }
+  C2_ghi:      { covariates: [general_ghi], baseline: C0 }
+  S_ec:        { covariates: [ghi_ec, temp_ec] }
+  S_gdfs:      { covariates: [ghi_gdfs, temp_gdfs] }
+  S_sg:        { covariates: [ghi_sg, temp_sg] }
+  S_ss:        { covariates: [ghi_ss, temp_ss] }
+  A_side3:     { covariates: [ghi_gdfs, ghi_ec, ghi_sg, general_temp], note: "三源并排，让 M5 自己学权重" }
+  A_mean4:     { covariates: [ghi_mean4, general_temp] }
+  A_med4:      { covariates: [ghi_med4, general_temp] }
+  A_trim4:     { covariates: [ghi_trim4, general_temp] }
+  A_inverr:    { covariates: [ghi_inverr, general_temp] }
+  A_inverr_p:  { covariates: [ghi_inverr_p, general_temp] }
+  A_bias:      { covariates: [ghi_bias, general_temp] }
+  A_ec_p13:    { covariates: [ghi_ec_p13, general_temp] }
+  D_envelope:  { extends: C1_online, covariates: [ghi_max4, ghi_min4] }
+  D_spread:    { extends: C1_online, covariates: [ghi_spread4] }
+  D_gstd:      { extends: C1_online, covariates: [ghi_ec_gstd] }
+  D_kt:        { covariates: [kt_cons, general_temp] }
+  D_clear:     { extends: C1_online, covariates: [ghi_clear] }
+  D_phys:      { covariates: [p_phys] }
+  D_phys_ghi:  { covariates: [p_phys, general_ghi] }
+  D_obs:       { extends: C1_online, covariates: [ghi_real], note: "GHI_real 只作 past-only" }
+
+evaluation:
+  baseline: C1_online                # 未写 baseline 的实验都和它比
+  primary_by_type: { ultra_short: nanwang_ultra_short, short: nanwang_short_D+1 }
+  keep_rule:                         # 保留规则（显式实验报告 + 精排贪心都用）
+    min_mean_gain: 0.3               # 平均提升（百分点）
+    ci: 0.95                         # 按天分块 bootstrap 置信区间，下界需 > 0
+    bootstrap: 2000
+    min_station_win_frac: 0.65       # 不变差的站占比
+  weather_edges: [0.35, 0.75]        # 结果按实测晴空指数分 阴/多云/晴 拆解（只诊断，不进模型）
 
 # ----------------------------------------------------------------------------
-# 7. 评估与判定
+# LightGBM 粗排
 # ----------------------------------------------------------------------------
-evaluation:
-  metrics: [nanwang_ultra_short, nanwang_short_D+1]
-  primary_by_type: { ultra_short: nanwang_ultra_short, short: nanwang_short_D+1 }
-  paired_test:
-    unit: station_day                 # 逐站逐日指标配对
-    min_mean_gain: 0.3
-    min_station_win_frac: 0.65
-    bootstrap: 2000
-    ci: 0.95
-  veto: { max_drop_secondary: 0.5 }
-  stop_rule: { max_covariates: 10, consecutive_fail: 2 }
-  ablation_alert_drop: 3.0
-  report: ${run.out_dir}/report.md
+rank:
+  target: residual                   # residual = (标签 − C0 预测)/cap；level = 标签/cap（没有 C0 预测时自动退化）
+  baseline_exp: C0
+  leads: { ultra_short: [0, 15], short: [55, 150] }   # 闭区间，0 起
+  issue_time: { short: "10:00", ultra_short: null }   # short 每站每天取 ≤10:00 的最后一行，与 D+1 指标同口径
+  min_clear: 50                      # 只用白天样本
+  max_rows: 400000                   # 样本上限（随机抽，种子固定）
+  train_frac: 0.7                    # 按日期切：前 70% 天训练，后 30% 天验证
+  candidates: auto                   # auto = features 里 candidate != false 的全部；或显式列表
+  context_features: [lead, clear_target, last_ratio, yday_ratio]   # 只作背景，不参与排序
+  n_repeats: 5
+  noise_columns: 2                   # 高斯噪声参照列，重要性不高于它的视为无用
+  corr_threshold: 0.95               # |Spearman| 超过它的候选归为一簇，额外做簇级置换
+  lgbm:
+    objective: regression
+    learning_rate: 0.05
+    num_leaves: 31
+    min_data_in_leaf: 200
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l2: 1.0
+    num_boost_round: 600
+    early_stopping_rounds: 50
+    verbose: -1
+    seed: 0
+
+# ----------------------------------------------------------------------------
+# M5 精排（贪心）
+# ----------------------------------------------------------------------------
+search:
+  start: C0                          # 起点组合（实验名）；也可写 C1_online 在线上组合上继续加
+  order_from: rank                   # rank = 读 rank_lgbm 的输出；list = 用下面的 order
+  order: [general_ghi, ghi_ec, ghi_gdfs, ghi_sg, ghi_ss, general_temp, p_phys, kt_cons, ghi_spread4]
+  top_k: 12                          # 只尝试排序前 k 个
+  drop_below_noise: true
+  fusion_methods: [median, mean, trim_mean, inv_error]   # 候选与已选同 quantity 特征尝试合成一列的方式
+  fusion_with: first                 # first = 只与该物理量第一个已选特征融合（每候选 ≤ 1+4 次推理）；all = 与每个都试
+  fusion_reference: ghi_real         # inv_error / bias_mean 的参考真值（power = 用功率折算）
+  max_selected: 10
+  max_consecutive_fail: 2

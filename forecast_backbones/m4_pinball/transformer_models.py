@@ -1,4 +1,4 @@
-"""M4 quantile adapter. Reuses M4 layers without changing the original M4 model."""
+"""Self-contained M4 quantile adapter using only this model's local layers."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from torch import nn
 
 from interfaces.modeloutput import TransformersAdaptedModelOutput
 
-from ..m4.layers.feature_collator import HFFeatureCollator
-from ..m4.layers.PatchTST_backbone import PatchTST_backbone
-from ..m4.layers.RevIN import RevIN
+from .layers.feature_collator import HFFeatureCollator
+from .layers.PatchTST_backbone import PatchTST_backbone
+from .layers.RevIN import RevIN
 from .config import load_config
 from .decision import decide
 from .losses import pinball_loss
@@ -35,7 +35,7 @@ class TransformersAdaptedM4PinballModel(nn.Module):
             self.pv_revin_layer = RevIN(
                 1, affine=m["affine"], subtract_last=m["subtract_last"]
             )
-        # Only the last projection expands: one distinct output for every (time, tau).
+        # Both heads produce a distinct output for every (time, tau).
         self.model = PatchTST_backbone(
             c_in=m["enc_in"],
             context_window=self.context_length + self.prediction_length,
@@ -47,11 +47,17 @@ class TransformersAdaptedM4PinballModel(nn.Module):
             n_heads=m["n_heads"],
             d_model=m["d_model"],
             d_ff=m["d_ff"],
+            norm="BatchNorm",  # Match M4's adapter; the backbone default is LayerNorm.
             dropout=m["dropout"],
             act=m["activation"],
             fc_dropout=m["fc_dropout"],
             head_dropout=m["head_dropout"],
             embedding_dim=m["embedding_dim"],
+            head_type=m["prediction_head"],
+            prediction_length=self.prediction_length,
+            n_quantiles=len(self.levels),
+            step_head_hidden=m["step_head_hidden"],
+            step_head_position_dim=m["step_head_position_dim"],
         )
 
     def _capacity(self, batch, batch_size, device):

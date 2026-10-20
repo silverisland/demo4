@@ -1,0 +1,5 @@
+# M8-style per-step residual decoder; keep backbone, loss and decision unchanged.
+model:
+  prediction_head: step_cov
+  step_head_hidden: 256
+  step_head_position_dim: 32

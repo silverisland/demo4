@@ -8,10 +8,59 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from transformers import TrainingArguments
+from transformers import Trainer, TrainingArguments
 
 from .config import load_config
 from .decision import level_value, quantile_cols
+from .selection import METRIC, decision_metrics, metadata
+
+
+class M4PinballTrainer(Trainer):
+    """Gather decision points across devices before scoring station-days."""
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+        labels = inputs.get("labels")
+        with torch.no_grad(), self.compute_loss_context_manager():
+            output = model(**inputs)
+        loss = output.loss.detach().mean() if output.loss is not None else None
+        if prediction_loss_only:
+            return loss, None, None
+        target = (
+            labels[self.model.labels_name[0]] if isinstance(labels, dict) else labels
+        )
+        # Avoid gathering quantile/embedding auxiliaries. HF/Accelerate gathers
+        # points, capacities and labels together and removes padded DDP samples.
+        predictions = (output.logits.detach(), output.aux["cap"].detach()[:, None])
+        return loss, predictions, target.detach() if target is not None else None
+
+    def evaluation_loop(
+        self,
+        dataloader,
+        description,
+        prediction_loss_only=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        output = super().evaluation_loop(
+            dataloader,
+            description,
+            prediction_loss_only=False,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        if output.label_ids is not None:
+            point, capacity = output.predictions
+            scores = decision_metrics(
+                point,
+                output.label_ids,
+                capacity,
+                metadata(dataloader.dataset, self.model.config),
+            )
+            output.metrics.update(
+                {f"{metric_key_prefix}_{key}": value for key, value in scores.items()}
+            )
+        return output
 
 
 def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
@@ -42,9 +91,9 @@ def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
         save_strategy="epoch",
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        prediction_loss_only=True,
+        metric_for_best_model=f"eval_{METRIC}",
+        greater_is_better=True,
+        prediction_loss_only=False,
         label_names=["labels"],
         remove_unused_columns=False,
         report_to=[],

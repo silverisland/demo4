@@ -9,18 +9,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
-from transformers import EarlyStoppingCallback, Trainer, set_seed
+from transformers import EarlyStoppingCallback, set_seed
 
 from pipelines.transformer_dataset import UnifiedDataset
 
 from .config import feature_columns, load_config
+from .selection import METRIC, select_validation_rows
 from .transformer_models import TransformersAdaptedM4PinballModel
-from .transformer_trainer import M4Pinball_build_training_args, evaluate_model
+from .transformer_trainer import (
+    M4Pinball_build_training_args,
+    M4PinballTrainer,
+    evaluate_model,
+)
 
 COLLATE = partial(UnifiedDataset.collate_fn, for_hf_trainer=True, drop_str_type=False)
 
 
-def build_dataset(source, cfg, supervised=True):
+def build_dataset(source, cfg, supervised=True, drop_empty_targets=True):
     ds = cfg["dataset"]
     target, horizon = ds["target_col"], cfg["inference"]["pred_len"]
 
@@ -32,7 +37,7 @@ def build_dataset(source, cfg, supervised=True):
                 raise ValueError(
                     f"{target} must contain exactly {horizon} values per row"
                 )
-            result.append(bool(np.isfinite(arr).any()))
+            result.append(not drop_empty_targets or bool(np.isfinite(arr).any()))
         return result
 
     if isinstance(source, pd.DataFrame):
@@ -73,14 +78,15 @@ def train(config, train_source, valid_source, out_dir, max_steps=-1, test_source
     model = TransformersAdaptedM4PinballModel(cfg)
     train_ds, valid_ds = (
         build_dataset(train_source, cfg),
-        build_dataset(valid_source, cfg),
+        build_dataset(valid_source, cfg, drop_empty_targets=False),
     )
-    trainer = Trainer(
+    selection_ds = select_validation_rows(valid_ds, cfg)
+    trainer = M4PinballTrainer(
         model=model,
         args=args,
         data_collator=COLLATE,
         train_dataset=train_ds,
-        eval_dataset=valid_ds,
+        eval_dataset=selection_ds,
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=cfg["optimization"]["patience"]
@@ -97,7 +103,12 @@ def train(config, train_source, valid_source, out_dir, max_steps=-1, test_source
             yaml.safe_dump(
                 {
                     "model_name": "m4_pinball",
-                    "selection_metric": "eval_loss (capacity-normalized pinball)",
+                    "selection_metric": f"eval_{METRIC}",
+                    "greater_is_better": True,
+                    "selection_issue_time": "10:00 (latest at or before)",
+                    "selection_window": "D+1 [00:00, 24:00), 15-minute steps",
+                    "selection_aggregation": "mean of clipped station-day scores",
+                    "selection_rows": len(selection_ds),
                     "max_steps": max_steps,
                     "train": str(train_source)
                     if not isinstance(train_source, pd.DataFrame)

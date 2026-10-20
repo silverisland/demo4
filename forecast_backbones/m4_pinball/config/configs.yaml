@@ -32,6 +32,9 @@ model:
   head_dropout: 0.1
   activation: ReLU
   embedding_dim: 256
+  prediction_head: flatten         # flatten baseline | step_cov experimental decoder
+  step_head_hidden: 256            # Used only by step_cov.
+  step_head_position_dim: 32       # Within-patch position embedding, step_cov only.
   loss_type: pinball
   quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 decision:
@@ -57,7 +60,7 @@ optimization:
   batch_size: 64                  # Per device; quantile decisions need extra memory.
   eval_batch_size: 32
   gradient_accumulation_steps: 1
-  patience: 10
+  patience: 10                    # Consecutive epochs without D+1 score improvement.
   num_workers: 0
   use_cpu: false
   fp16: true                     # Automatically disabled when CUDA is unavailable.

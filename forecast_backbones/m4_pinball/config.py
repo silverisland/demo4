@@ -44,6 +44,8 @@ def load_config(source=None):
                 "e_layers",
                 "d_ff",
                 "embedding_dim",
+                "step_head_hidden",
+                "step_head_position_dim",
             )
         },
     }.items():
@@ -53,6 +55,8 @@ def load_config(source=None):
         raise ValueError("patch_len exceeds the combined input window")
     if m["d_model"] % m["n_heads"]:
         raise ValueError("n_heads must divide d_model")
+    if m["prediction_head"] not in ("flatten", "step_cov"):
+        raise ValueError("prediction_head must be flatten or step_cov")
     if not ds["conv_cols"] or len(ds["conv_cols"]) != len(ds["conv_predict_cols"]):
         raise ValueError(
             "Historical and future weather columns must have equal nonzero lengths"

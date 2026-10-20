@@ -69,13 +69,16 @@ def make_batch(B=3, history=32, future=16):
     }
 
 
-def make_frame(B=4):
-    batch = make_batch(B)
+def make_frame(B=4, history=32, future=16):
+    batch = make_batch(B, history=history, future=future)
     data = {
         k: list(v.numpy()) if isinstance(v, torch.Tensor) else v
         for k, v in batch.items()
     }
     data["observe_power_future"] = list(batch["general_ghi_predict"].numpy() / 25.0)
+    data["timestamp_win"] = (
+        pd.Timestamp("2025-06-01 09:00").value // 10**9 + np.arange(B) * 900
+    )
     return pd.DataFrame(data)
 
 
@@ -120,6 +123,33 @@ def test_forward_backward_and_label_independence(cfg, B, revin, affine):
     batch["observe_power_future"] = torch.full((B, 16), 1e6)
     torch.testing.assert_close(output.logits, model(batch).logits)
     assert build_evaluator("m4_pinball") is evaluate_model
+
+
+def test_encoder_batchnorm_matches_m4(cfg):
+    model = TransformersAdaptedM4PinballModel(cfg)
+    encoder = model.model.backbone.encoder
+    norms = [m for m in encoder.modules() if isinstance(m, torch.nn.BatchNorm1d)]
+    assert len(norms) == 2 * cfg["model"]["e_layers"]
+    assert not any(isinstance(m, torch.nn.LayerNorm) for m in encoder.modules())
+    assert all(m.num_features == cfg["model"]["d_model"] for m in norms)
+
+    # Training must update running statistics; evaluation must keep them fixed.
+    model.train()
+    loss = model(make_batch(), {"observe_power_future": torch.full((3, 16), 20.0)}).loss
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(m.num_batches_tracked.item() == 1 for m in norms)
+    assert all(
+        m.weight.grad is not None and torch.isfinite(m.weight.grad).all() for m in norms
+    )
+    stats = [(m.running_mean.clone(), m.running_var.clone()) for m in norms]
+    model.eval()
+    with torch.no_grad():
+        model(make_batch(B=1))
+    for m, (mean, var) in zip(norms, stats):
+        torch.testing.assert_close(m.running_mean, mean, rtol=0, atol=0)
+        torch.testing.assert_close(m.running_var, var, rtol=0, atol=0)
+        assert m.num_batches_tracked.item() == 1
 
 
 def test_train_skips_numpy_decision(cfg, monkeypatch):
@@ -192,7 +222,7 @@ def test_station_capacity_mapping(cfg):
 
 
 def test_decision_matches_m8_for_valid_inputs():
-    from forecast_backbones.m8 import decision as original
+    from forecast_backbones.m4_pinball.tests import m8_decision_reference as original
 
     rng = np.random.default_rng(0)
     q = np.sort(rng.uniform(0, 100, (3, 192, 9)), axis=-1)
@@ -297,14 +327,21 @@ def test_optional_physics_columns(cfg):
     assert (point[:, :2] == 0).all() and (point <= 21.0).all()
 
 
-def test_train_save_reload_and_unified_inference(cfg, tmp_path):
-    frame = make_frame()
+@pytest.mark.parametrize("head", ["flatten", "step_cov"])
+def test_train_save_reload_and_unified_inference(cfg, tmp_path, head):
+    cfg["model"]["prediction_head"] = head
+    cfg["inference"]["pred_len"] = 192
+    frame = make_frame(future=192)
     tr, va = tmp_path / "train.parquet", tmp_path / "valid.parquet"
     frame.to_parquet(tr, index=False)
     frame.to_parquet(va, index=False)
     out_dir = tmp_path / "run"
     trainer = train(cfg, tr, va, out_dir, max_steps=2, test_source=va)
     assert trainer.state.global_step == 2
+    assert trainer.args.metric_for_best_model == "eval_nanwang_short_d1"
+    assert trainer.args.greater_is_better
+    assert trainer.state.best_metric is not None
+    assert "eval_nanwang_short_d1" in trainer.evaluate()
     restored = build_model(
         "m4_pinball", load_config(out_dir / "model_result" / "model_config.yaml")
     )
@@ -312,7 +349,8 @@ def test_train_save_reload_and_unified_inference(cfg, tmp_path):
     restored.eval()
     trainer.model.eval()
     torch.testing.assert_close(
-        restored(make_batch()).logits, trainer.model(make_batch()).logits
+        restored(make_batch(future=192)).logits,
+        trainer.model(make_batch(future=192)).logits,
     )
     ds = build_dataset(frame, cfg)
     result = evaluate_model(restored, ds, COLLATE, cfg)
@@ -338,8 +376,9 @@ def test_training_script_dispatch(cfg, tmp_path):
 
     train_script.RUN_PATH = tmp_path
     args, device = train_script.build_train_args("m4_pinball", cfg)
-    assert args.prediction_loss_only and device == "cpu"
-    frame = make_frame()
+    assert not args.prediction_loss_only and device == "cpu"
+    cfg["inference"]["pred_len"] = 192
+    frame = make_frame(future=192)
     for split in ("train", "valid", "test"):
         frame.to_parquet(tmp_path / f"{split}.parquet", index=False)
     config_path = tmp_path / "cfg.yaml"

@@ -1,0 +1,49 @@
+dataset:
+  pv_col: observe_power
+  target_col: observe_power_future
+  timestamp_col: timestamp_win
+  capacity_col: cap_power_on
+  entity_col: station
+  conv_cols: [general_ghi, general_temp]
+  conv_predict_cols: [general_ghi_predict, general_temp_predict]
+  weather_offsets: [0.0, 15.0]
+  weather_scales: [1000.0, 15.0]
+  # UnifiedDataset converts naive local timestamps to wall-clock epoch seconds.
+  # Use utc only when input values represent actual Unix timestamps.
+  timestamp_basis: local_wall
+
+inference:
+  input_len: 672
+  pred_len: 16
+
+model:
+  d_model: 128
+  n_heads: 4
+  e_layers: 3
+  d_layers: 2
+  d_ff: 512
+  dropout: 0.1
+  fast_len: 96
+  fast_patch: 4
+  slow_patch: 96
+  use_slow: true
+  use_recent: true
+  head_dim: 64
+
+augmentation:
+  probability: 0.25
+  lengths: [1, 2, 4, 8]
+  methods: [missing, hold, zero, previous_day, trend]
+
+optimization:
+  random_seed: 2025
+  train_epochs: 100
+  learning_rate: 0.0003
+  weight_decay: 0.001
+  warmup_ratio: 0.05
+  batch_size: 64
+  gradient_accumulation_steps: 4
+  eval_batch_size: 128
+  num_workers: 0
+  patience: 8
+  use_cpu: false

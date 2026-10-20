@@ -1,8 +1,57 @@
 # M4-Pinball
 
 保留 M4 的 PatchTST、天气 / 历史功率 / 外部预测输入及 RevIN，新增独立的
-`m4_pinball` 模型。只读复用 `m4/layers`，不修改 M4 源码、配置或权重。
-末层由 `64 → H` 改为 `64 → H×K`，输出 `[B,H,K]`，默认 H=192、K=9。
+`m4_pinball` 模型。PatchTST、RevIN 和输入整理代码均自带于 `m4_pinball/layers`，
+不引用 `m4` 或其他模型包；共享的 `interfaces`、`pipelines` 仍为框架依赖。
+原 M4 源码、配置和权重不受影响。
+默认 Flatten 预测头的末层由 `64 → H` 改为 `64 → H×K`，输出 `[B,H,K]`，默认 H=192、K=9。
+Encoder 显式使用与 M4 一致的 BatchNorm；预测头内原有的 LayerNorm 保持不变。
+
+## 可选的逐时刻预测头
+
+`model.prediction_head` 默认仍为 `flatten`，可切换为 `step_cov` 做对照实验。
+后者借鉴 M8 的“逐时刻特征拼接 + 残差 MLP”，实现完全位于本模型内，不导入 M8。
+
+| 项目 | flatten（基线） | step_cov（实验） |
+| --- | --- | --- |
+| 解码输入 | 所有通道、所有 Patch 展平 | 对应 Patch 的各通道编码 + Patch 内位置 + 该步协变量 |
+| 默认结构 | 6912 → 256 → 256 → 64 → 1728 | 803 → 256 → 9，加 803 → 9 线性跳接 |
+| 时间维度 | 一次输出整个 192 步窗口 | 同一预测头应用于每个未来时刻 |
+| 分位数 | 共享隐藏层，末层权重各自独立 | 共享隐藏层，末层权重各自独立 |
+
+M4 编码保留通道维，因此将同一 Patch 的 3 个通道各 256 维编码拼成 768 维，
+再加 32 维位置嵌入与 3 维逐步输入，共 803 维。逐步输入包括未来天气和外部 PV 预测，
+沿用进入 backbone 前的 RevIN 单位；没有新增数据列，也不读取未来标签。
+残差 MLP 为 `Linear → GELU → Dropout → Linear` 加线性跳接。
+不额外添加单调或非负输出约束，继续在原始分位数上计算 Pinball loss。
+
+默认 patch_len/stride 都保持 96，以便单独验证换头的影响。重叠 Patch 时选择覆盖该步且
+起点最晚的可用 Patch；未来步未被任何 Patch 覆盖则报错，可调整 stride 或启用 `padding_patch: end`。
+`aux.quantiles` 仍为 `[B,H,K]`；`embeddings` 在 step_cov 下为逐步隐藏向量的均值，
+宽度为 `step_head_hidden`，不再由 `embedding_dim` 控制。
+
+直接试用配置：
+
+```bash
+python -m forecast_backbones.m4_pinball.train \
+  --config forecast_backbones/m4_pinball/config/variants/step_cov.yaml \
+  --train /path/to/train.parquet --valid /path/to/valid.parquet \
+  --out runs/m4_pinball/step_cov
+```
+
+若已有数据列、容量或训练参数的自定义 YAML，在原 YAML 的 `model` 下加入以下字段即可，
+其余参数与基线保持一致：
+
+```yaml
+model:
+  prediction_head: step_cov
+  step_head_hidden: 256
+  step_head_position_dim: 32
+```
+
+两种头使用相同的 Pinball loss、decision 和南网 D+1 选模；实验效果需用相同数据切分、
+训练预算和随机种子对照。新头需要重新训练，不能直接加载 Flatten 头的完整权重。
+已有 BatchNorm + Flatten 权重和配置仍可严格加载，未声明 prediction_head 的旧配置默认使用 flatten。
 
 ## 训练与推理
 
@@ -74,7 +123,25 @@ python train_shell/train_script.py --model_name m4_pinball \
 公共入口沿用其要求：切分目录需要 `train.parquet`、`valid.parquet`、`test.parquet`。
 专用入口只需要 train / valid。模型和 evaluator 由现有 registry 自动发现，不用修改注册表。
 
-最优模型按验证集容量归一化 Pinball loss 选择，patience 按验证次数计；不是直接按南网日分选模型。
+训练损失仍为容量归一化 Pinball loss；**最优模型和早停改按决策后的南网短期 D+1
+评分 `eval_nanwang_short_d1`（越高越好）**。每个 epoch 评估一次，`patience` 按评分未提升的
+连续验证次数计。评分口径与 M8 默认选模一致，但实现自带于本模型：
+
+- 每站每个起报日取 10:00 及之前的最后一行；重复站点/起报时刻保留第一行。
+- 第 0 个预测对应起报后 15 分钟，只评分次日 `[00:00, 24:00)` 内的点。
+  10:00 起报、192 点预测时，使用下标 `[55:151]` 共 96 点。
+- 日分为 `max(0, 100 * (1 - sqrt(mean(((y-p)/max(y,0.2C))**2))))`，
+  `p` 使用当前 decision 配置处理后的上报点，`C` 使用每站固定装机容量。
+- 缺测标签仅排除对应点；全缺测的站日跳过，不回退到更早的起报。
+  允许部分有效点参与日分，与 M8 一致。最终分数为所有有效站日分数的等权平均，
+  不是全点 RMSE，也不是站均值或月均值再平均。
+- 时间沿用数据集时间轴（与 M8 相同），不自动转换时区；起报列应与业务评分的钟表时间一致。
+  缺少站点标识或没有可评分的 D+1 数据会明确报错，不静默改回 loss 选模。
+
+验证只运行上述被选中的起报行；日志同时记录评分、有效站日数和有效点数。
+`eval_loss` 仍是这些起报行整个预测窗口的 Pinball 诊断值，不参与选模。
+多卡评估先汇总各卡预测、去掉补齐样本，再统一计算日分。
+训练结束自动恢复评分最高的 checkpoint；最终结果导出仍覆盖整个验证集。
 输出 `model_result/model.safetensors` 和同目录 `model_config.yaml`，以及 `result_val.parquet`、
 可选 `result_test.parquet`。结果包含上报曲线、中位数、裁剪后的分位列、原始分位和容量，便于后续比较决策策略。
 
@@ -108,3 +175,11 @@ python -m pytest forecast_backbones/m4_pinball/tests -q
 
 测试包括独立分位梯度、RevIN 共享反归一化、缺测标签、容量错误、M8 选点数值对齐、分段优先级、
 物理开关、零缩放和越界修复，以及本地 Parquet → Trainer → 保存重载 → 统一推理的完整链路。
+选模测试覆盖起报筛选、D+1 边界、缺测和日分截零、批量大小，以及 loss 与业务评分方向相反时的
+最佳权重保存、恢复和早停。
+
+独立性测试在仅含本模型和框架依赖的临时目录运行，并禁止导入其他模型包。
+层代码迁入本目录本身不改变计算；但随后修复了 Encoder 漏传归一化参数的问题，
+从误用的 LayerNorm 改为与 M4 一致的 BatchNorm。
+修复前的 LayerNorm 版 m4_pinball 权重无法严格加载到当前结构，需要重新训练；
+不可通过忽略缺失权重来视为等价迁移。
