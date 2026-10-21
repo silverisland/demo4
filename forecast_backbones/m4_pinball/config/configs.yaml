@@ -60,7 +60,8 @@ optimization:
   batch_size: 64                  # Per device; quantile decisions need extra memory.
   eval_batch_size: 32
   gradient_accumulation_steps: 1
-  patience: 10                    # Consecutive epochs without D+1 score improvement.
+  eval_every_steps: 250           # Optimizer steps; 0/null restores evaluation each epoch.
+  patience: 8                     # Consecutive validations without D+1 score improvement.
   num_workers: 0
   use_cpu: false
   fp16: true                     # Automatically disabled when CUDA is unavailable.

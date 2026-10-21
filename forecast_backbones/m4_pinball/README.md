@@ -124,8 +124,23 @@ python train_shell/train_script.py --model_name m4_pinball \
 专用入口只需要 train / valid。模型和 evaluator 由现有 registry 自动发现，不用修改注册表。
 
 训练损失仍为容量归一化 Pinball loss；**最优模型和早停改按决策后的南网短期 D+1
-评分 `eval_nanwang_short_d1`（越高越好）**。每个 epoch 评估一次，`patience` 按评分未提升的
-连续验证次数计。评分口径与 M8 默认选模一致，但实现自带于本模型：
+评分 `eval_nanwang_short_d1`（越高越好）**。默认每 250 个优化器步评估并保存一次，连续
+8 次评分未提升则早停，与 M8 K2 的验证节奏一致。`patience` 按连续验证次数计，不是 epoch
+或微批次数；梯度累积时，完成一次参数更新才计一步。训练最后一步即使不足验证间隔，也会
+评估、保存并参与最佳权重选择。达到 `--max-steps` 或 epoch 预算同样结束训练。
+
+可在自定义 YAML 中覆盖（不用修改网络或损失）：
+
+```yaml
+optimization:
+  eval_every_steps: 250   # 0/null 改回每个 epoch 验证、保存
+  patience: 8            # 连续多少次 D+1 分数未创新高就停止
+```
+
+若要复现此前按 epoch 选模的训练流程，显式设置 `eval_every_steps: 0` 和 `patience: 10`。
+早停与最佳权重都按严格更高的原始 D+1 分数判断，不平滑、不用 eval_loss，不修改 decision
+配置。验证集必需且不得使用测试集代替；`--test` 只用于恢复最佳权重后的最终结果导出。
+评分口径与 M8 默认选模一致，但实现自带于本模型：
 
 - 每站每个起报日取 10:00 及之前的最后一行；重复站点/起报时刻保留第一行。
 - 第 0 个预测对应起报后 15 分钟，只评分次日 `[00:00, 24:00)` 内的点。
@@ -141,7 +156,10 @@ python train_shell/train_script.py --model_name m4_pinball \
 验证只运行上述被选中的起报行；日志同时记录评分、有效站日数和有效点数。
 `eval_loss` 仍是这些起报行整个预测窗口的 Pinball 诊断值，不参与选模。
 多卡评估先汇总各卡预测、去掉补齐样本，再统一计算日分。
-训练结束自动恢复评分最高的 checkpoint；最终结果导出仍覆盖整个验证集。
+训练结束自动恢复评分最高的 checkpoint，随后才导出 `model_result` 并评估；最终结果导出仍覆盖整个验证集。
+`train_log.json` 记录每次训练期验证、最佳分数 `best`、最佳步数 `best_step`、
+实际停止步数 `stopped_step` 和最佳 checkpoint 路径。最后一步分数变差时仍导出较早的最佳权重，
+不会把最后一步当成最佳步；没有选出有效 checkpoint 时直接报错。
 输出 `model_result/model.safetensors` 和同目录 `model_config.yaml`，以及 `result_val.parquet`、
 可选 `result_test.parquet`。结果包含上报曲线、中位数、裁剪后的分位列、原始分位和容量，便于后续比较决策策略。
 
@@ -176,7 +194,7 @@ python -m pytest forecast_backbones/m4_pinball/tests -q
 测试包括独立分位梯度、RevIN 共享反归一化、缺测标签、容量错误、M8 选点数值对齐、分段优先级、
 物理开关、零缩放和越界修复，以及本地 Parquet → Trainer → 保存重载 → 统一推理的完整链路。
 选模测试覆盖起报筛选、D+1 边界、缺测和日分截零、批量大小，以及 loss 与业务评分方向相反时的
-最佳权重保存、恢复和早停。
+最佳权重保存、恢复和早停，以及按优化步验证、非整间隔最后一步选模、短于一个验证间隔的训练。
 
 独立性测试在仅含本模型和框架依赖的临时目录运行，并禁止导入其他模型包。
 层代码迁入本目录本身不改变计算；但随后修复了 Encoder 漏传归一化参数的问题，

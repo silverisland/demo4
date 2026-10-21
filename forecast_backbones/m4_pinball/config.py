@@ -30,6 +30,12 @@ def load_config(source=None):
                 base[key] = deepcopy(value)
 
     merge(cfg, source or {})
+    opt = cfg["optimization"]
+    every = opt["eval_every_steps"]
+    if every is not None and (type(every) is not int or every < 0):
+        raise ValueError("eval_every_steps must be a nonnegative integer or null")
+    if type(opt["patience"]) is not int or opt["patience"] <= 0:
+        raise ValueError("patience must be a positive integer (validation count)")
     ds, inf, m = (cfg[k] for k in ("dataset", "inference", "model"))
     for key, value in {
         **inf,

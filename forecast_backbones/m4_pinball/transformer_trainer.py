@@ -8,15 +8,34 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from transformers import Trainer, TrainingArguments
+from transformers import Trainer, TrainerCallback, TrainingArguments
 
 from .config import load_config
 from .decision import level_value, quantile_cols
 from .selection import METRIC, decision_metrics, metadata
 
 
+class FinalStepValidationCallback(TrainerCallback):
+    """Include the last optimizer step in selection, even before the first interval."""
+
+    def on_step_end(self, args, state, control, **kwargs):
+        strategy = getattr(args, "eval_strategy", None)
+        if strategy is None:
+            strategy = args.evaluation_strategy
+        if strategy == "steps" and state.global_step >= state.max_steps:
+            # HF evaluates before saving, then restores its best checkpoint at
+            # train end. Both flags are needed for an off-interval final step.
+            control.should_evaluate = True
+            control.should_save = True
+        return control
+
+
 class M4PinballTrainer(Trainer):
     """Gather decision points across devices before scoring station-days."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_callback(FinalStepValidationCallback())
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
@@ -71,6 +90,9 @@ def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
         if "eval_strategy" in inspect.signature(TrainingArguments).parameters
         else "evaluation_strategy"
     )
+    every = opt["eval_every_steps"]
+    strategy = "steps" if every else "epoch"
+    intervals = {"eval_steps": every, "save_steps": every} if every else {}
     return TrainingArguments(
         output_dir=str(result_dir),
         per_device_train_batch_size=opt["batch_size"],
@@ -88,7 +110,7 @@ def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
         use_cpu=use_cpu,
         fp16=bool(opt["fp16"] and not use_cpu),
         dataloader_num_workers=opt["num_workers"],
-        save_strategy="epoch",
+        save_strategy=strategy,
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model=f"eval_{METRIC}",
@@ -98,7 +120,8 @@ def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
         remove_unused_columns=False,
         report_to=[],
         logging_steps=10,
-        **{eval_key: "epoch"},
+        **{eval_key: strategy},
+        **intervals,
     )
 
 

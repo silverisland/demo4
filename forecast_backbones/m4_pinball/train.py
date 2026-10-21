@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from functools import partial
 from pathlib import Path
 
@@ -109,6 +110,10 @@ def train(config, train_source, valid_source, out_dir, max_steps=-1, test_source
                     "selection_window": "D+1 [00:00, 24:00), 15-minute steps",
                     "selection_aggregation": "mean of clipped station-day scores",
                     "selection_rows": len(selection_ds),
+                    "eval_every_steps": cfg["optimization"]["eval_every_steps"],
+                    "patience": cfg["optimization"]["patience"],
+                    "patience_unit": "validation_count",
+                    "final_step_validation": True,
                     "max_steps": max_steps,
                     "train": str(train_source)
                     if not isinstance(train_source, pd.DataFrame)
@@ -122,6 +127,39 @@ def train(config, train_source, valid_source, out_dir, max_steps=-1, test_source
             encoding="utf-8",
         )
     trainer.train()
+    # load_best_model_at_end has already restored the highest D+1 checkpoint
+    # on every rank. Never export unselected weights as the final model.
+    best = trainer.state.best_model_checkpoint
+    if best is None or trainer.state.best_metric is None:
+        raise RuntimeError("Training produced no D+1-selected checkpoint")
+    if trainer.is_world_process_zero():
+        best_step = int(Path(best).name.rsplit("-", 1)[1])
+        history = [row for row in trainer.state.log_history if f"eval_{METRIC}" in row]
+        (out / "train_log.json").write_text(
+            json.dumps(
+                {
+                    "metric": f"eval_{METRIC}",
+                    "higher_better": True,
+                    "best": float(trainer.state.best_metric),
+                    "best_step": best_step,
+                    "best_model_checkpoint": best,
+                    "stopped_step": int(trainer.state.global_step),
+                    "eval_every_steps": cfg["optimization"]["eval_every_steps"],
+                    "patience": cfg["optimization"]["patience"],
+                    "patience_unit": "validation_count",
+                    "history": history,
+                },
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            f"[m4_pinball] restored best D+1={trainer.state.best_metric:.4f} "
+            f"at step {best_step}; training stopped at {trainer.state.global_step}",
+            flush=True,
+        )
     trainer.save_model(str(out / "model_result"))
     trainer.save_state()
     trainer.save_metrics("eval", trainer.evaluate())
