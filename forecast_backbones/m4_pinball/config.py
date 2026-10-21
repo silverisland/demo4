@@ -31,6 +31,9 @@ def load_config(source=None):
 
     merge(cfg, source or {})
     opt = cfg["optimization"]
+    for key in ("warmup_steps", "save_every_steps"):
+        if type(opt[key]) is not int or opt[key] < 0:
+            raise ValueError(f"{key} must be a nonnegative integer")
     every = opt["eval_every_steps"]
     if every is not None and (type(every) is not int or every < 0):
         raise ValueError("eval_every_steps must be a nonnegative integer or null")

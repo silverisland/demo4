@@ -1,0 +1,16 @@
+# M8 K2 optimization recipe on the existing M4-Pinball architecture.
+# Dataset columns retain the M4 defaults; use --hint_col timesfm3 if appropriate.
+model:
+  loss_type: pinball
+decision:
+  point:
+    default: p_star
+    by_step: [{steps: [0, 16], method: p_star_l1}]
+optimization:
+  random_seed: 0
+  learning_rate: 0.0003
+  warmup_steps: 300
+  batch_size: 8
+  eval_every_steps: 250
+  save_every_steps: 500
+  patience: 8

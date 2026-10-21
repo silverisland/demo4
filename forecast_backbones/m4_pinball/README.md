@@ -7,6 +7,82 @@
 默认 Flatten 预测头的末层由 `64 → H` 改为 `64 → H×K`，输出 `[B,H,K]`，默认 H=192、K=9。
 Encoder 显式使用与 M4 一致的 BatchNorm；预测头内原有的 LayerNorm 保持不变。
 
+## 参考 M8 K2 的训练与完整评估入口
+
+本次沿用现有 **M4-Pinball / Flatten** 架构和容量归一化 Pinball loss，不增加残差学习、
+太阳几何、额外输入通道或实验预测头。`config/m8_k2_training.yaml` 沿用默认 Flatten
+和 Pinball，并提供参考 M8 K2 的优化设置：学习率 3e-4、warmup 300 步、batch 8/卡、
+seed 0、每 250 步 D+1 验证、patience 8、每 500 步独立权重快照。
+6000 步预算由命令行指定。该配置是待实验的训练方案，不代表已验证能提升精度。
+原 `configs.yaml` 的学习率、批量等默认值保留。
+
+在当前仓库根目录运行（两份项目均提供这些入口）：
+
+```bash
+bash train_shell/train_m4_pinball.sh \
+  --config forecast_backbones/m4_pinball/config/m8_k2_training.yaml \
+  --train_parquet 'datasets/train/*.parquet' \
+  --valid_parquet 'datasets/valid/*.parquet' \
+  --batch_size 8 --max_steps 6000 --save_every 500 \
+  --run_id m4_k2_recipe --seed 0
+
+R=runs/m4_pinball/m4_k2_recipe
+bash eval_m4_pinball.sh --runs "$R" \
+  --test 'datasets/test/*.parquet' --full --out "$R/eval_final"
+```
+
+`PYTHON=/path/to/env/bin/python` 可选择 Python 环境；训练设置 `NPROC_PER_NODE=2` 使用两卡
+DDP，`CUDA_VISIBLE_DEVICES` 选择设备，必要时设置 `MASTER_PORT`。直接 Python 入口为
+`python -m forecast_backbones.m4_pinball.train` 和
+`python -m forecast_backbones.m4_pinball.evaluate`。
+训练支持 `--cpu`，评估支持 `--device cpu`。训练输入支持单文件、目录内 `*.parquet`、
+带引号的 glob；Python API 还支持文件列表。不同数据集不得引用同一个文件；跨文件的时间
+划分及标签窗口隔离仍需在准备数据时保证。没有验证集时不会自动拿测试集选模。
+
+**先核对列名与容量**：此配置默认仍读 M4 的 `chronos`，不会偷偷换外部预测器。
+如果要与 M8 K2 使用相同的 TimesFM 提示，在训练命令增加 `--hint_col timesfm3`
+（实际列为 `tsfm_predict` 就填该名字，不自动猜测）。如数据缺少 `cap_mw`，可增加
+`--station_meta /path/to/info.csv`；CSV 使用 M8 站表中的 `plant_pointname` 和 `GCCAPACITY`，
+数据的 `station` 必须与 `plant_pointname` 对得上。容量映射会写入模型配置，评估无需原 CSV。
+也可在 YAML 设置 `dataset.capacity_by_station`。容量与功率单位必须相同。
+
+默认预测规则与 M8 K2 一致：前 16 步 `p_star_l1`，其余 `p_star`；保留原有物理裁剪设置。
+`p_star` 是分位预测后的决策，不参与训练梯度。验证、早停和最终评估默认使用同一套规则。
+对照同一份权重的全时段中位数：
+
+```bash
+bash eval_m4_pinball.sh --runs "$R" --test 'datasets/test/*.parquet' \
+  --point median --out "$R/eval_median"
+```
+
+不传 `--point` 保留保存的分段规则；`--point median/p_star/p_star_l1` 表示全时段覆盖，
+会清空分段规则。这里只支持单个运行目录，不将多个模型的集成混入这次对照。
+`--full` 为兼容 M8 命令的标志；评估始终覆盖全部起报行，不用小时抽样代替完整超短期指标。
+
+输出说明：
+
+- `model_result/`：验证模式下为最佳 D+1 权重，包含 `model.safetensors` 和有效配置。
+  评估传运行根目录时自动加载此处，严格校验权重形状。
+- `checkpoint-N/`：HF 验证及最佳模型检查点，默认每 250 步，保留数量受 Trainer 控制。
+  这些目录也保存模型配置，可直接用于评估。
+- `checkpoints/step_000500/` 等：`--save_every` 控制的独立权重快照（含配置、不含优化器），
+  额外保存预算末步；不自动清理，独立于 HF 检查点。可用 `--save_every 0` 关闭。
+  快照是该步权重；运行根目录始终优先加载 `model_result`。
+- `train_log.json`：验证轨迹、最佳步和停止步；`run.yaml`：训练模式和选模口径。
+- 评估输出 `result_test.parquet`、`eval_config.yaml`、`reports/decision.json`，以及
+  `reports/{ultra_daily,d1_daily,monthly,station_metrics,summary}.csv`、`reports/summary.json`。
+
+南网评分代码从指定 NextM8 的 `pipelines/nanwang_metric.py` 固定复制到本包，运行不依赖 M8。
+完整报告按 M8 实现：站内日分汇成月分、剔除样本天数不足 3 天的月份、有效月份等权、
+最后站间等权；保留其两位小数规则。没有足够数据时汇总为缺失值/JSON null，不伪报 0。
+超短期保留 M8 的 16 lead 对齐和 06:15–20:00 时段，其代码使用日误差和除以 96。
+训练选模仍是有效站日 D+1 分数直接平均，与完整报告的月/站汇总不是同一聚合方式。
+测试集必须包含足够连续的 15 分钟起报行，才能形成完整的超短期 lead。
+
+全量重训也可显式使用 `--refit`、去掉 `--valid_parquet` 并给定 `--max_steps`。
+该模式没有验证、early stop 或“最佳”选模，导出最后一步；日志明确记录 `mode: refit`。
+如需重训，先在验证集确定预算，不能根据测试分数反复挑步。已有的带验证训练方式仍是默认。
+
 ## 可选的逐时刻预测头
 
 `model.prediction_head` 默认仍为 `flatten`，可切换为 `step_cov` 做对照实验。
@@ -139,7 +215,7 @@ optimization:
 
 若要复现此前按 epoch 选模的训练流程，显式设置 `eval_every_steps: 0` 和 `patience: 10`。
 早停与最佳权重都按严格更高的原始 D+1 分数判断，不平滑、不用 eval_loss，不修改 decision
-配置。验证集必需且不得使用测试集代替；`--test` 只用于恢复最佳权重后的最终结果导出。
+配置。选模训练的验证集必需且不得使用测试集代替；`--test` 只用于恢复最佳权重后的最终结果导出。
 评分口径与 M8 默认选模一致，但实现自带于本模型：
 
 - 每站每个起报日取 10:00 及之前的最后一行；重复站点/起报时刻保留第一行。

@@ -335,8 +335,10 @@ def test_train_save_reload_and_unified_inference(cfg, tmp_path, head):
     tr, va = tmp_path / "train.parquet", tmp_path / "valid.parquet"
     frame.to_parquet(tr, index=False)
     frame.to_parquet(va, index=False)
+    te = tmp_path / "test.parquet"
+    frame.to_parquet(te, index=False)
     out_dir = tmp_path / "run"
-    trainer = train(cfg, tr, va, out_dir, max_steps=2, test_source=va)
+    trainer = train(cfg, tr, va, out_dir, max_steps=2, test_source=te)
     assert trainer.state.global_step == 2
     assert trainer.args.metric_for_best_model == "eval_nanwang_short_d1"
     assert trainer.args.greater_is_better

@@ -57,6 +57,8 @@ optimization:
   learning_rate: 0.0001
   weight_decay: 0.0001
   warmup_ratio: 0.01
+  warmup_steps: 0                 # When positive, overrides warmup_ratio.
+  save_every_steps: 0             # Optional portable weight snapshots; 0 disables.
   batch_size: 64                  # Per device; quantile decisions need extra memory.
   eval_batch_size: 32
   gradient_accumulation_steps: 1

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+import yaml
+from safetensors.torch import save_model
 from torch.utils.data import DataLoader
 from transformers import Trainer, TrainerCallback, TrainingArguments
 
@@ -36,6 +39,13 @@ class M4PinballTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.add_callback(FinalStepValidationCallback())
+
+    def _save(self, output_dir=None, state_dict=None):
+        super()._save(output_dir, state_dict)
+        Path(output_dir or self.args.output_dir, "model_config.yaml").write_text(
+            yaml.safe_dump(self.model.config, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
@@ -82,7 +92,29 @@ class M4PinballTrainer(Trainer):
         return output
 
 
-def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
+class PortableCheckpointCallback(TrainerCallback):
+    """Weight-only snapshots, independent of HF's best-model checkpoints."""
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        every = model.config["optimization"]["save_every_steps"]
+        if (
+            every
+            and state.is_world_process_zero
+            and (state.global_step % every == 0 or state.global_step >= state.max_steps)
+        ):
+            out = (
+                Path(args.output_dir) / "checkpoints" / f"step_{state.global_step:06d}"
+            )
+            out.mkdir(parents=True, exist_ok=True)
+            save_model(model, str(out / "model.safetensors"))
+            (out / "model_config.yaml").write_text(
+                yaml.safe_dump(model.config, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+        return control
+
+
+def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1, refit=False):
     opt = load_config(model_config)["optimization"]
     use_cpu = opt["use_cpu"] or not torch.cuda.is_available()
     eval_key = (
@@ -91,8 +123,10 @@ def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
         else "evaluation_strategy"
     )
     every = opt["eval_every_steps"]
-    strategy = "steps" if every else "epoch"
-    intervals = {"eval_steps": every, "save_steps": every} if every else {}
+    strategy = "no" if refit else ("steps" if every else "epoch")
+    intervals = (
+        {"eval_steps": every, "save_steps": every} if every and not refit else {}
+    )
     return TrainingArguments(
         output_dir=str(result_dir),
         per_device_train_batch_size=opt["batch_size"],
@@ -102,6 +136,7 @@ def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
         learning_rate=opt["learning_rate"],
         weight_decay=opt["weight_decay"],
         warmup_ratio=opt["warmup_ratio"],
+        warmup_steps=opt["warmup_steps"],
         lr_scheduler_type="cosine",
         max_grad_norm=1.0,
         max_steps=max_steps,
@@ -112,7 +147,7 @@ def M4Pinball_build_training_args(model_config, result_dir, max_steps=-1):
         dataloader_num_workers=opt["num_workers"],
         save_strategy=strategy,
         save_total_limit=2,
-        load_best_model_at_end=True,
+        load_best_model_at_end=not refit,
         metric_for_best_model=f"eval_{METRIC}",
         greater_is_better=True,
         prediction_loss_only=False,
